@@ -33,16 +33,13 @@ import (
 
 func TestNewThreshold(t *testing.T) {
 	src := `1+1==2`
-	rt := goja.New()
 	abortOnFail := false
 	gracePeriod := types.NullDurationFrom(2 * time.Second)
-	th, err := newThreshold(src, rt, abortOnFail, gracePeriod)
+	th, err := newThreshold(src, abortOnFail, gracePeriod)
 	assert.NoError(t, err)
 
 	assert.Equal(t, src, th.Source)
 	assert.False(t, th.LastFailed)
-	assert.NotNil(t, th.pgm)
-	assert.Equal(t, rt, th.rt)
 	assert.Equal(t, abortOnFail, th.AbortOnFail)
 	assert.Equal(t, gracePeriod, th.AbortGracePeriod)
 }

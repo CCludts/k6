@@ -26,70 +26,138 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/dop251/goja"
-
 	"go.k6.io/k6/lib/types"
+	"go.k6.io/k6/pkg/combinators"
 )
-
-const jsEnvSrc = `
-function p(pct) {
-	return __sink__.P(pct/100.0);
-};
-`
-
-var jsEnv *goja.Program
-
-func init() {
-	pgm, err := goja.Compile("__env__", jsEnvSrc, true)
-	if err != nil {
-		panic(err)
-	}
-	jsEnv = pgm
-}
 
 // Threshold is a representation of a single threshold for a single metric
 type Threshold struct {
 	// Source is the text based source of the threshold
 	Source string
-	// LastFailed is a makrer if the last testing of this threshold failed
+	// Condition is the threshold condition parsed from the Source expression
+	Condition *ThresholdCondition
+	// LastFailed is a marker if the last testing of this threshold failed
 	LastFailed bool
 	// AbortOnFail marks if a given threshold fails that the whole test should be aborted
 	AbortOnFail bool
 	// AbortGracePeriod is a the minimum amount of time a test should be running before a failing
 	// this threshold will abort the test
 	AbortGracePeriod types.NullDuration
-
-	pgm *goja.Program
-	rt  *goja.Runtime
 }
 
-func newThreshold(src string, newThreshold *goja.Runtime, abortOnFail bool, gracePeriod types.NullDuration) (*Threshold, error) {
-	pgm, err := goja.Compile("__threshold__", src, true)
+func newThreshold(src string, abortOnFail bool, gracePeriod types.NullDuration) (*Threshold, error) {
+	condition, err := ParseThresholdCondition(src)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Threshold{
 		Source:           src,
+		Condition:        condition,
 		AbortOnFail:      abortOnFail,
 		AbortGracePeriod: gracePeriod,
-		pgm:              pgm,
-		rt:               newThreshold,
 	}, nil
 }
 
-func (t Threshold) runNoTaint() (bool, error) {
-	v, err := t.rt.RunProgram(t.pgm)
-	if err != nil {
-		return false, err
+func (t *Threshold) runNoTaint(sinks map[string]float64) (bool, error) {
+	// Extract the sink value for the aggregation method used in the threshold
+	// expression
+	lhs, ok := sinks[t.Condition.AggregationMethod]
+	if !ok {
+		return false, fmt.Errorf("unable to compute %s over metrics; reason: no such metric found", t.Condition.AggregationMethod)
 	}
-	return v.ToBoolean(), nil
+
+	// Apply the threshold expression operator to the left and
+	// right hand side values
+	passes := false
+	switch t.Condition.Operator {
+	case ">":
+		passes = lhs > t.Condition.Value
+	case ">=":
+		passes = lhs >= t.Condition.Value
+	case "<=":
+		passes = lhs <= t.Condition.Value
+	case "<":
+		passes = lhs < t.Condition.Value
+	case "==":
+		passes = lhs == t.Condition.Value
+	case "===":
+		// Considering a sink always maps to float64 values,
+		// strictly equal is equivalent to loosely equal
+		passes = lhs == t.Condition.Value
+	case "!=":
+		passes = lhs != t.Condition.Value
+	}
+
+	// Perform the actual threshold verification
+	return passes, nil
 }
 
-func (t *Threshold) run() (bool, error) {
-	b, err := t.runNoTaint()
+func (t *Threshold) run(sinks map[string]float64) (bool, error) {
+	b, err := t.runNoTaint(sinks)
 	t.LastFailed = !b
 	return b, err
+}
+
+type ThresholdCondition struct {
+	AggregationMethod string  `json:"left-hand"`
+	Operator          string  `json:"operator"`
+	Value             float64 `json:"right-hand"`
+}
+
+// ParseThresholdCondition parses a threshold condition expression,
+// as defined in a JS script (for instance p(95)<1000), into a ThresholdCondition
+// instance, using our parser combinators package.
+
+// This parser expect a threshold expression matching the following BNF
+//
+// ```
+// assertion           -> aggregation_method whitespace* operator whitespace* float
+// aggregation_method  -> trend | rate | gauge | counter
+// counter             -> "count" | "sum" | "rate"
+// gauge               -> "last" | "min" | "max" | "value"
+// rate                -> "rate"
+// trend               -> "min" | "mean" | "avg" | "max" | percentile
+// percentile          -> "p(" float ")"
+// operator            -> ">" | ">=" | "<=" | "<" | "==" | "===" | "!="
+// float               -> digit+ (. digit+)?
+// digit               -> "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+// whitespace          -> space | tab
+// tab                 -> "\t"
+// space               -> " "
+// ```
+func ParseThresholdCondition(expression string) (*ThresholdCondition, error) {
+	parser := combinators.Sequence(
+		ParseAggregationMethod(),
+		combinators.DiscardAll(combinators.Whitespace()),
+		ParseOperator(),
+		combinators.DiscardAll(combinators.Whitespace()),
+		combinators.Float(),
+	)
+
+	// Parse the Threshold as provided in the JS script options thresholds value (p(95)<1000)
+	result := parser([]rune(expression))
+	if result.Err != nil {
+		return nil, fmt.Errorf("parsing threshold condition %s failed; reason: %w", expression, result.Err)
+	}
+
+	// The Sequence combinator will return a slice of interface{}
+	// instances. Up to us to decide what we want to cast them down
+	// to.
+	// Considering our expression format, the parser should return a slice
+	// of size 3 to us: aggregation_method operator sink_value. The type system
+	// ensures us it should be the case too, but let's protect our future selves anyhow.
+	parsed := result.Payload.([]interface{})
+	if len(parsed) != 3 {
+		return nil, fmt.Errorf("parsing threshold condition %s failed; reason: malformed expression", expression)
+	}
+
+	// Unpack the various components of the parsed threshold expression
+	method := parsed[0].(string)
+	operator := parsed[1].(string)
+	value := parsed[2].(float64)
+
+	return &ThresholdCondition{AggregationMethod: method, Operator: operator, Value: value}, nil
 }
 
 type thresholdConfig struct {
@@ -122,9 +190,9 @@ func (tc thresholdConfig) MarshalJSON() ([]byte, error) {
 
 // Thresholds is the combination of all Thresholds for a given metric
 type Thresholds struct {
-	Runtime    *goja.Runtime
 	Thresholds []*Threshold
 	Abort      bool
+	Sinked     map[string]float64
 }
 
 // NewThresholds returns Thresholds objects representing the provided source strings
@@ -138,36 +206,31 @@ func NewThresholds(sources []string) (Thresholds, error) {
 }
 
 func newThresholdsWithConfig(configs []thresholdConfig) (Thresholds, error) {
-	rt := goja.New()
-	if _, err := rt.RunProgram(jsEnv); err != nil {
-		return Thresholds{}, fmt.Errorf("threshold builtin error: %w", err)
-	}
-
 	ts := make([]*Threshold, len(configs))
 	for i, config := range configs {
-		t, err := newThreshold(config.Threshold, rt, config.AbortOnFail, config.AbortGracePeriod)
+		t, err := newThreshold(config.Threshold, config.AbortOnFail, config.AbortGracePeriod)
 		if err != nil {
 			return Thresholds{}, fmt.Errorf("threshold %d error: %w", i, err)
 		}
 		ts[i] = t
 	}
 
-	return Thresholds{rt, ts, false}, nil
+	return Thresholds{ts, false, make(map[string]float64)}, nil
 }
 
-func (ts *Thresholds) updateVM(sink Sink, t time.Duration) error {
-	ts.Runtime.Set("__sink__", sink)
+func (ts *Thresholds) fillSinks(sink Sink, t time.Duration) {
 	f := sink.Format(t)
 	for k, v := range f {
-		ts.Runtime.Set(k, v)
+		ts.Sinked[k] = v
 	}
-	return nil
 }
 
 func (ts *Thresholds) runAll(t time.Duration) (bool, error) {
 	succ := true
 	for i, th := range ts.Thresholds {
-		b, err := th.run()
+		b, err := th.run(ts.Sinked)
+
+		// b, err := th.run()
 		if err != nil {
 			return false, fmt.Errorf("threshold %d run error: %w", i, err)
 		}
@@ -188,9 +251,12 @@ func (ts *Thresholds) runAll(t time.Duration) (bool, error) {
 // Run processes all the thresholds with the provided Sink at the provided time and returns if any
 // of them fails
 func (ts *Thresholds) Run(sink Sink, t time.Duration) (bool, error) {
-	if err := ts.updateVM(sink, t); err != nil {
-		return false, err
-	}
+	// if err := ts.updateVM(sink, t); err != nil {
+	// 	return false, err
+	// }
+
+	ts.fillSinks(sink, t)
+
 	return ts.runAll(t)
 }
 
